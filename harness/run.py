@@ -65,8 +65,15 @@ def main():
         ]
     }
     print("Declaring agent roster to gateway...")
-    client.post_roster(roster)
-    print("Roster successfully declared.")
+    import httpx
+    try:
+        client.post_roster(roster)
+        print("Roster successfully declared.")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 409:
+            print("Roster already declared or run is in progress. Continuing...")
+        else:
+            raise e
 
     # 4. Question Loop
     print("\nStarting question-answering loop...")
