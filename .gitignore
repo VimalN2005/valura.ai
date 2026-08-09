@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local datasets (very large and unique to your run)
+data/
+
+# Environments and API Keys
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
