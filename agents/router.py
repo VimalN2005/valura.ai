@@ -27,10 +27,18 @@ def extract_date_from_prompt(prompt: str) -> Optional[str]:
 
 def classify_intent_via_llm(prompt: str) -> List[str]:
     """Uses valura-fast to classify the question's required specialists."""
-    classifier = get_model("valura-fast")
+    from agno.agent import Agent
+    classifier_agent = Agent(
+        model=get_model("valura-fast"),
+        description="Intent classifier for financial query router",
+        instructions=[
+            "You are the routing gateway for a financial assistant.",
+            "Analyze the user's question and classify which specialist role(s) are required to answer it.",
+            "Output only a JSON array of strings containing the roles, for example: [\"book_qa\"] or [\"book_qa\", \"market_desk\"]."
+        ]
+    )
     
-    classification_prompt = f"""You are the routing gateway for a financial assistant.
-Analyze the user's question and classify which specialist role(s) are required to answer it.
+    classification_prompt = f"""Analyze the user's question and classify which specialist role(s) are required.
 
 Available roles:
 - book_qa: for cash balances, transactions count, holdings, stock quantities, values, fee summaries, portfolio rebalance drifts.
@@ -39,15 +47,11 @@ Available roles:
 - market_desk: for instrument details (sectors, exchanges), historical close prices, and market news.
 - compliance: for investment advice (recommendations, buy/sell suitability), target allocation suggestions, or questions trying to access multiple accounts/clients.
 
-If a question spans multiple areas (e.g. asking for client drift AND market news for a stock), list both roles.
-Always output a JSON array of strings containing the roles, for example: ["book_qa"] or ["book_qa", "market_desk"].
-Output only the JSON array, no other text or formatting wrappers.
-
 Question: {prompt}
 Classified Roles:"""
 
     try:
-        response = classifier.response(classification_prompt)
+        response = classifier_agent.run(classification_prompt)
         text = response.content.strip()
         # Clean markdown code blocks if any
         if text.startswith("```"):
@@ -166,9 +170,13 @@ def generate_heuristic_answer(client_id: str, prompt: str) -> Optional[Dict[str,
 
 def extract_answer_value_via_llm(answer_text: str, question: str) -> Optional[str]:
     """Uses valura-fast to parse the single target value/date/number from the text."""
-    parser = get_model("valura-fast")
-    prompt = f"""You are a financial parser.
-Given the following user question and the specialist's answer, extract the single figure, count, or date that answers the question.
+    from agno.agent import Agent
+    parser_agent = Agent(
+        model=get_model("valura-fast"),
+        description="Value extractor parser",
+        instructions=["Extract the single final figure, count, or date. Output ONLY the extracted value as a string (or the word 'null')."]
+    )
+    prompt = f"""Given the following user question and the specialist's answer, extract the single figure, count, or date that answers the question.
 
 Output format rules:
 - Money/currency values: format as a clean decimal string with 2 decimal places, no currency symbol, no thousands separator (e.g. "71.88", "15386.78", "0.00").
@@ -182,7 +190,7 @@ Answer: {answer_text}
 Extracted Value:"""
 
     try:
-        response = parser.response(prompt)
+        response = parser_agent.run(prompt)
         val = response.content.strip().replace('"', '').replace("'", "")
         if val.lower() == "null" or not val:
             return None
@@ -325,17 +333,24 @@ def route_question(question_id: str, client_id: str, prompt: str) -> Dict[str, A
 
     # 5. Synthesize Combined Answer if multiple specialists ran
     if len(agent_outputs) > 1:
-        synthesizer = get_model("valura-fast")
-        synthesis_prompt = f"""You are a financial synthesizer.
-Combine the following findings from different specialists into a single, cohesive, professional natural language answer to the question: "{prompt}".
-Do not perform any arithmetic yourself. Merely synthesize the findings.
+        from agno.agent import Agent
+        synthesizer_agent = Agent(
+            model=get_model("valura-fast"),
+            description="Synthesis Specialist",
+            instructions=[
+                "You are a financial synthesizer.",
+                "Combine the findings from different specialists into a single, cohesive, professional natural language answer.",
+                "Do not perform any arithmetic yourself. Merely synthesize the findings."
+            ]
+        )
+        synthesis_prompt = f"""Combine the following findings from different specialists into a single, cohesive, professional natural language answer to the question: "{prompt}".
 
 Findings:
 {chr(10).join(agent_outputs)}
 
 Answer:"""
         try:
-            res = synthesizer.response(synthesis_prompt)
+            res = synthesizer_agent.run(synthesis_prompt)
             final_answer = res.content.strip()
         except Exception:
             # Fallback join
