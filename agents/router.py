@@ -19,10 +19,31 @@ AGENT_MAP = {
 }
 
 def extract_date_from_prompt(prompt: str) -> Optional[str]:
-    """Helper to extract an ISO date (YYYY-MM-DD) from the prompt."""
-    match = re.search(r"\b(202\d-\d{2}-\d{2})\b", prompt)
-    if match:
-        return match.group(1)
+    """
+    Extracts an ISO date (YYYY-MM-DD) or converts a natural date
+    (e.g., '1 April 2026', '26 November 2025') into standard ISO format.
+    """
+    # 1. ISO format check (YYYY-MM-DD)
+    match_iso = re.search(r"\b(202\d)-(\d{2})-(\d{2})\b", prompt)
+    if match_iso:
+        return match_iso.group(0)
+        
+    # 2. Natural language date check
+    months_map = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12"
+    }
+    prompt_lower = prompt.lower()
+    months_regex = "|".join(months_map.keys())
+    match_nat = re.search(r"\b(\d{1,2})\s+(" + months_regex + r")\s+(202\d)\b", prompt_lower)
+    if match_nat:
+        day = int(match_nat.group(1))
+        month_name = match_nat.group(2)
+        year = int(match_nat.group(3))
+        month = months_map[month_name]
+        return f"{year}-{month}-{day:02d}"
+        
     return None
 
 # --- Deterministic Local Solver ---
@@ -33,7 +54,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
     Ensures 100% correctness, zero token usage, and 0ms latency for mechanical questions.
     """
     from tools.book_tools import (
-        load_json_file, BOOK_PATH, 
+        load_json_file, BOOK_PATH, MARKET_PATH,
         get_client_kyc, get_client_cash_balance, get_client_notes, 
         get_client_holdings_and_drift, get_market_instrument, 
         get_market_price, get_market_news, quantize_decimal
@@ -77,7 +98,6 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
         # Catch questions asking for things not recorded on the platform
         unanswerable_keywords = ["nominee", "email", "mobile", "phone", "execution venue", "venue", "brokerage fee rate", "commission rate"]
         if any(x in prompt_lower for x in unanswerable_keywords):
-            # Email check: make sure we're not confusing physical address with email address
             return {
                 "answer": "",
                 "answer_value": None,
@@ -90,7 +110,133 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "agents": ["router"]
             }
 
-        # --- Standard KYC details ---
+        # --- Sector Concentration / Exposure ---
+        if any(x in prompt_lower for x in ("concentrated", "exposure", "sit in", "sitting in", "proportion", "percentage of portfolio", "weight in")):
+            sectors_map = {
+                "communication": "Communication Services",
+                "technology": "Information Technology",
+                "tech": "Information Technology",
+                "financial": "Financials",
+                "staples": "Consumer Staples",
+                "discretionary": "Consumer Discretionary",
+                "diversified": "Diversified"
+            }
+            target_sector = None
+            for key, sec in sectors_map.items():
+                if key in prompt_lower:
+                    target_sector = sec
+                    break
+                    
+            if target_sector:
+                # Load files
+                book = load_json_file(BOOK_PATH)
+                market = load_json_file(MARKET_PATH)
+                
+                # Get holdings and valuation
+                port = get_client_holdings_and_drift(client_id)
+                total_portfolio = Decimal(port["total_portfolio"])
+                
+                # Find symbols in sector
+                sector_symbols = [inst["symbol"] for inst in market["instruments"] if inst["sector"] == target_sector]
+                
+                sector_val = Decimal("0.00")
+                citations = []
+                client_record = next(c for c in book["clients"] if c["id"] == client_id)
+                
+                for sym in sector_symbols:
+                    if sym in port["holdings"]:
+                        pos_id = next((p["id"] for p in client_record["positions_snapshot"] if p["symbol"] == sym), None)
+                        if pos_id:
+                            citations.append(pos_id)
+                        sector_val += Decimal(port["stock_values"].get(sym, "0.00"))
+                        
+                if total_portfolio > Decimal("0.00"):
+                    pct = (sector_val / total_portfolio) * Decimal("100.00")
+                else:
+                    pct = Decimal("0.00")
+                    
+                val_str = quantize_decimal(pct)
+                if len(citations) > 6:
+                    citations = [client_id]
+                    
+                return {
+                    "answer": f"The concentration of client {client_id} in {target_sector} is {val_str}% of total portfolio value.",
+                    "answer_value": val_str,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+        # --- Rebalance Drift & Target Allocations ---
+        if any(x in prompt_lower for x in ("drift", "rebalance", "target", "overweight", "underweight", "away from", "allocation")):
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            if sym:
+                res = get_client_holdings_and_drift(client_id)
+                val = res["drift"].get(sym, "0.00")
+                citations = res["citations"]
+                if len(citations) > 6:
+                    citations = [client_id]
+                return {
+                    "answer": f"The rebalance drift for {sym} on client {client_id}'s account is {val} percentage points.",
+                    "answer_value": val,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+        # --- News Summary / Count ---
+        if "news" in prompt_lower or "headline" in prompt_lower or "article" in prompt_lower:
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            if sym:
+                res = get_market_news(sym)
+                news = res["news"]
+                if not news:
+                    return {
+                        "answer": "",
+                        "answer_value": None,
+                        "abstained": True,
+                        "refused": False,
+                        "reason": f"No news available for symbol {sym}.",
+                        "citations": [],
+                        "confidence": 1.0,
+                        "flags": [],
+                        "agents": ["router", "market_desk"]
+                    }
+                
+                ans = f"News headlines for {sym}: " + "; ".join(n["headline"] for n in news)
+                citations = res["citations"]
+                if len(citations) > 6:
+                    citations = [sym]
+                    
+                # If they ask for count
+                if "how many" in prompt_lower or "count" in prompt_lower:
+                    val = str(len(news))
+                else:
+                    val = None
+                    
+                return {
+                    "answer": ans,
+                    "answer_value": val,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "market_desk"]
+                }
+
+        # --- KYC details ---
         if "pan" in prompt_lower:
             res = get_client_kyc(client_id)
             val = res["pan"]
@@ -244,49 +390,6 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "refused": False,
                 "reason": None,
                 "citations": [largest["id"]],
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Book QA - Dividend checks ---
-        if "dividend" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            year_match = re.search(r"\b(202\d)\b", prompt)
-            year = year_match.group(1) if year_match else None
-            
-            book = load_json_file(BOOK_PATH)
-            client = next(c for c in book["clients"] if c["id"] == client_id)
-            target_as_at = as_at or book["meta"]["as_of"]
-            
-            divs = [t for t in client.get("transactions", []) if t["type"] == "dividend" and t["date"] <= target_as_at]
-            if sym:
-                divs = [t for t in divs if t["symbol"] == sym]
-            if year:
-                divs = [t for t in divs if t["date"][:4] == year]
-                
-            total_div = sum(Decimal(t["net_usd"]) for t in divs)
-            val = quantize_decimal(total_div)
-            div_txs = [t["id"] for t in divs]
-            citations = [client_id] if len(div_txs) > 6 else div_txs
-            if not citations:
-                citations = [client_id]
-                
-            ans = f"Total net dividend income received by client {client_id}"
-            if sym:
-                ans += f" from {sym}"
-            if year:
-                ans += f" during {year}"
-            ans += f" was USD {val}."
-            
-            return {
-                "answer": ans,
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": citations,
                 "confidence": 1.0,
                 "flags": [],
                 "agents": ["router", "book_qa"]
@@ -450,110 +553,6 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "agents": ["router", "book_qa"]
             }
 
-        # --- Book QA - Rebalance drift ---
-        if "drift" in prompt_lower or "rebalance" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            if sym:
-                res = get_client_holdings_and_drift(client_id)
-                val = res["drift"].get(sym, "0.00")
-                citations = res["citations"]
-                if len(citations) > 6:
-                    citations = [client_id]
-                return {
-                    "answer": f"The rebalance drift for {sym} on client {client_id}'s account is {val}%.",
-                    "answer_value": val,
-                    "abstained": False,
-                    "refused": False,
-                    "reason": None,
-                    "citations": citations,
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "book_qa"]
-                }
-
-        # --- Market Desk - Price ---
-        if "price" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            if sym:
-                res = get_market_price(sym)
-                val = res["price"]
-                return {
-                    "answer": f"The close price for {sym} as of {res['date']} was USD {val}.",
-                    "answer_value": val,
-                    "abstained": False,
-                    "refused": False,
-                    "reason": None,
-                    "citations": res["citations"],
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "market_desk"]
-                }
-
-        # --- Market Desk - Sector / Industry ---
-        if "sector" in prompt_lower or "industry" in prompt_lower or "exchange" in prompt_lower or "listed" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            if sym:
-                res = get_market_instrument(sym)
-                inst = res["instrument"]
-                if "sector" in prompt_lower:
-                    val = inst["sector"]
-                    ans = f"The sector for {sym} is {val}."
-                elif "industry" in prompt_lower:
-                    val = inst["industry"]
-                    ans = f"The industry for {sym} is {val}."
-                else:
-                    val = inst["listed_on"]
-                    ans = f"The exchange for {sym} is {val}."
-                return {
-                    "answer": ans,
-                    "answer_value": val,
-                    "abstained": False,
-                    "refused": False,
-                    "reason": None,
-                    "citations": res["citations"],
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "market_desk"]
-                }
-
-        # --- Market Desk - News Summary ---
-        if "news" in prompt_lower or "headline" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            if sym:
-                res = get_market_news(sym)
-                news = res["news"]
-                if not news:
-                    return {
-                        "answer": "",
-                        "answer_value": None,
-                        "abstained": True,
-                        "refused": False,
-                        "reason": f"No news available for symbol {sym}.",
-                        "citations": [],
-                        "confidence": 1.0,
-                        "flags": [],
-                        "agents": ["router", "market_desk"]
-                    }
-                ans = f"News headlines for {sym}: " + "; ".join(n["headline"] for n in news)
-                citations = res["citations"]
-                if len(citations) > 6:
-                    citations = [sym]
-                return {
-                    "answer": ans,
-                    "answer_value": None,
-                    "abstained": False,
-                    "refused": False,
-                    "reason": None,
-                    "citations": citations,
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "market_desk"]
-                }
-
         # --- Notes Summary Check ---
         if "note" in prompt_lower or "memo" in prompt_lower:
             res = get_client_notes(client_id)
@@ -699,7 +698,7 @@ Extracted Value:"""
 
 def extract_answer_value_heuristics(answer_text: str) -> Optional[str]:
     """Fallback regex extractor for value/number/date."""
-    dec_match = re.search(r"\b\d+\.\d{2}\b", answer_text)
+    dec_match = re.search(r"\b-?\d+\.\d{2}\b", answer_text)
     if dec_match:
         return dec_match.group(0)
     date_match = re.search(r"\b(202\d-\d{2}-\d{2})\b", answer_text)
