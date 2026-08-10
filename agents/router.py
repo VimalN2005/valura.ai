@@ -97,7 +97,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
 
         # --- Epistemic limits (Abstentions) ---
         # Refined to avoid mismatching "on the phone"
-        unanswerable_keywords = ["nominee", "email", "mobile number", "mobile no", "phone number", "phone no", "execution venue", "venue", "brokerage fee rate", "commission rate"]
+        unanswerable_keywords = ["nominee", "email", "mobile", "phone number", "phone no", "contact number", "contact details", "contact no", "telephone", "execution venue", "venue", "brokerage fee rate", "commission rate", "executed", "execution", "where was"]
         if any(x in prompt_lower for x in unanswerable_keywords):
             return {
                 "answer": "",
@@ -726,7 +726,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
 
         # --- Book QA - Holdings (Quantity or Symbol Count) ---
         # Run holdings before transaction counts to prevent mismatch on 'shares'
-        if any(x in prompt_lower for x in ("holding", "hold", "shares", "quantity", "how much", "symbol", "position")):
+        if any(x in prompt_lower for x in ("holding", "hold", "shares", "share", "quantity", "how much", "symbol", "position")):
             # Count distinct symbols held
             if "different symbol" in prompt_lower or "how many symbol" in prompt_lower or "number of symbol" in prompt_lower or "distinct holdings" in prompt_lower:
                 res = get_client_holdings_and_drift(client_id)
@@ -771,7 +771,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 }
 
         # --- Book QA - Aggregations (Total deposits, platform fees, dividends) ---
-        if any(x in prompt_lower for x in ("total", "how much", "sum", "overall")):
+        if any(x in prompt_lower for x in ("total", "how much", "sum", "overall", "aggregate", "funding", "net")):
             tx_type = None
             field_name = "amount_usd"
             if "deposit" in prompt_lower or "funding" in prompt_lower or "credit" in prompt_lower:
@@ -901,7 +901,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             }
 
         # --- KYC details ---
-        if "pan" in prompt_lower:
+        if re.search(r"\bpan\b", prompt_lower):
             res = get_client_kyc(client_id)
             val = res["pan"]
             return {
@@ -950,7 +950,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "agents": ["router", "kyc_profile"]
             }
             
-        if "date of birth" in prompt_lower or "dob" in prompt_lower:
+        if "date of birth" in prompt_lower or re.search(r"\bdob\b", prompt_lower):
             res = get_client_kyc(client_id)
             val = res["date_of_birth"]
             return {
@@ -998,6 +998,21 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             val = emp.get("employer") if "employer" in prompt_lower else emp.get("occupation")
             return {
                 "answer": f"The employment details show employer as {emp.get('employer')} and occupation as {emp.get('occupation')}.",
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": res["citations"],
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "kyc_profile"]
+            }
+            
+        if "kyc" in prompt_lower:
+            res = get_client_kyc(client_id)
+            val = res.get("kyc_status")
+            return {
+                "answer": f"The KYC standing for client {client_id} is: status is {val}.",
                 "answer_value": val,
                 "abstained": False,
                 "refused": False,
