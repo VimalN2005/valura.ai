@@ -33,18 +33,48 @@ def enforce_client_scope(client_id: str):
         )
 
 def get_resolved_client_id(client_id: str) -> str:
-    """Helper to enforce scope and return the actual client ID (resolving names if needed)."""
+    """Helper to enforce scope and return the actual client ID (resolving names/IDs if needed)."""
     if not run_context.client_id:
         return client_id
         
     resolved_id = client_id
     if not client_id.startswith("cli_"):
         try:
+            import re
             book = load_json_file(BOOK_PATH)
-            for c in book["clients"]:
-                if c["name"].strip().lower() == client_id.strip().lower():
-                    resolved_id = c["id"]
-                    break
+            scoped_client = next((c for c in book["clients"] if c["id"] == run_context.client_id), None)
+            if scoped_client:
+                # Helper to compare names removing spaces/punctuation
+                clean_name = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+                
+                # 1. Check Name
+                if clean_name(client_id) == clean_name(scoped_client["name"]):
+                    return run_context.client_id
+                    
+                # 2. Check Accounts
+                for acc in scoped_client.get("accounts", []):
+                    if client_id == acc.get("id") or client_id == acc.get("broker_ref"):
+                        return run_context.client_id
+                        
+                # 3. Check KYC ID or PAN
+                kyc = scoped_client.get("kyc", {})
+                if client_id == kyc.get("id") or client_id == kyc.get("pan"):
+                    return run_context.client_id
+                    
+                # 4. Check Suitability reviews
+                for rev in scoped_client.get("suitability_reviews", []):
+                    if client_id == rev.get("id"):
+                        return run_context.client_id
+                        
+                # 5. Check transactions
+                for tx in scoped_client.get("transactions", []):
+                    if client_id == tx.get("id") or client_id == tx.get("symbol"):
+                        return run_context.client_id
+                        
+                # 6. Check notes
+                for note in scoped_client.get("notes", []):
+                    if client_id == note.get("id"):
+                        return run_context.client_id
         except Exception:
             pass
             
