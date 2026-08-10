@@ -32,6 +32,29 @@ def enforce_client_scope(client_id: str):
             f"Cross-client data access denied. Question is scoped to {run_context.client_id}, but tool requested {client_id}."
         )
 
+def get_resolved_client_id(client_id: str) -> str:
+    """Helper to enforce scope and return the actual client ID (resolving names if needed)."""
+    if not run_context.client_id:
+        return client_id
+        
+    resolved_id = client_id
+    if not client_id.startswith("cli_"):
+        try:
+            book = load_json_file(BOOK_PATH)
+            for c in book["clients"]:
+                if c["name"].strip().lower() == client_id.strip().lower():
+                    resolved_id = c["id"]
+                    break
+        except Exception:
+            pass
+            
+    if resolved_id != run_context.client_id:
+        raise PermissionError(
+            f"Cross-client data access denied. Question is scoped to {run_context.client_id}, but tool requested {client_id}."
+        )
+        
+    return resolved_id
+
 def register_citations(citations: List[str]):
     """Register citations in the run context."""
     for c in citations:
@@ -81,7 +104,7 @@ def get_client_kyc(client_id: str) -> Dict[str, Any]:
     Retrieve client KYC details with strict masking.
     Checks for risk profile conflicts between KYC and Suitability Reviews.
     """
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     client = next((c for c in book["clients"] if c["id"] == client_id), None)
@@ -146,7 +169,7 @@ def get_client_kyc(client_id: str) -> Dict[str, Any]:
 
 def get_client_accounts(client_id: str) -> Dict[str, Any]:
     """Retrieve client accounts information."""
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     client = next((c for c in book["clients"] if c["id"] == client_id), None)
@@ -167,7 +190,7 @@ def get_client_cash_balance(client_id: str) -> Dict[str, Any]:
     Deterministically calculates client cash balance.
     Respects run_context.as_at filter.
     """
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     client = next((c for c in book["clients"] if c["id"] == client_id), None)
@@ -209,7 +232,7 @@ def get_client_cash_balance(client_id: str) -> Dict[str, Any]:
 
 def get_client_transactions(client_id: str, limit: int = 10, type_filter: Optional[str] = None) -> Dict[str, Any]:
     """Retrieve filtered and sorted transaction list."""
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     client = next((c for c in book["clients"] if c["id"] == client_id), None)
@@ -244,7 +267,7 @@ def get_client_transactions(client_id: str, limit: int = 10, type_filter: Option
 
 def get_client_notes(client_id: str) -> Dict[str, Any]:
     """Retrieve client notes and memos up to run_context.as_at."""
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     client = next((c for c in book["clients"] if c["id"] == client_id), None)
@@ -274,7 +297,7 @@ def get_client_holdings_and_drift(client_id: str) -> Dict[str, Any]:
     Reconstructs client holdings, values them, checks coverage,
     and calculates drift against target allocations.
     """
-    enforce_client_scope(client_id)
+    client_id = get_resolved_client_id(client_id)
     
     book = load_json_file(BOOK_PATH)
     market = load_json_file(MARKET_PATH)

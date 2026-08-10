@@ -359,7 +359,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 # Get sector symbols
                 sector_symbols = [inst["symbol"] for inst in market["instruments"] if inst["sector"] == target_sector]
                 
-                total_snapshot_val = sum(Decimal(p["market_value_usd"]) for p in snapshot)
+                total_snapshot_val = sum((Decimal(p["market_value_usd"]) for p in snapshot), Decimal("0.00"))
                 sector_val = Decimal("0.00")
                 citations = []
                 
@@ -402,7 +402,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 
                 # Compute total stock values from snapshot only (excluding cash for drift check)
                 snapshot = client.get("positions_snapshot", [])
-                total_stock_val = sum(Decimal(p["market_value_usd"]) for p in snapshot)
+                total_stock_val = sum((Decimal(p["market_value_usd"]) for p in snapshot), Decimal("0.00"))
                 
                 # Get queried symbol's snapshot record
                 pos = next((p for p in snapshot if p["symbol"] == sym), None)
@@ -583,7 +583,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             if year:
                 divs = [t for t in divs if t["date"][:4] == year]
                 
-            total_div = sum(Decimal(t["net_usd"]) for t in divs)
+            total_div = sum((Decimal(t["net_usd"]) for t in divs), Decimal("0.00"))
             val = quantize_decimal(total_div)
             div_txs = [t["id"] for t in divs]
             citations = [client_id] if len(div_txs) > 6 else div_txs
@@ -774,9 +774,9 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
         if any(x in prompt_lower for x in ("total", "how much", "sum", "overall")):
             tx_type = None
             field_name = "amount_usd"
-            if "deposit" in prompt_lower or "funding" in prompt_lower:
+            if "deposit" in prompt_lower or "funding" in prompt_lower or "credit" in prompt_lower:
                 tx_type = "deposit"
-            elif "withdrawal" in prompt_lower:
+            elif "withdrawal" in prompt_lower or "debit" in prompt_lower:
                 tx_type = "withdrawal"
             elif "fee" in prompt_lower or "charge" in prompt_lower:
                 tx_type = "fee"
@@ -829,7 +829,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                             
                     filtered_txs.append(t)
                     
-                total_val = sum(Decimal(t[field_name]) for t in filtered_txs)
+                total_val = sum((Decimal(t[field_name]) for t in filtered_txs), Decimal("0.00"))
                 val_str = quantize_decimal(total_val)
                 tx_ids = [t["id"] for t in filtered_txs]
                 citations = [client_id] if len(tx_ids) > 6 else tx_ids
@@ -868,7 +868,8 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             }
 
         # --- Notes Summary Check ---
-        if "note" in prompt_lower or "memo" in prompt_lower:
+        if any(x in prompt_lower for x in ("note", "memo", "summarise", "summary", "comment", "history")) or \
+           ("file" in prompt_lower and ("compliance" in prompt_lower or "relationship" in prompt_lower or "action" in prompt_lower)):
             res = get_client_notes(client_id)
             notes = res["notes"]
             if not notes:

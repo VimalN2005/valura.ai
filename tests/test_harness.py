@@ -36,15 +36,15 @@ class TestValuraHarness(unittest.TestCase):
         self.assertTrue(float(res["cash_balance"]) > 0)
         
     def test_as_at_filtering(self):
-        # Set as_at to a past date where no transactions had happened yet (e.g. 2024-11-01)
-        reset_run_context("cli_1001", as_at="2024-11-01")
+        # Set as_at to a past date where no transactions had happened yet (e.g. 2025-04-01)
+        reset_run_context("cli_1001", as_at="2025-04-01")
         res = get_client_cash_balance("cli_1001")
         self.assertEqual(res["cash_balance"], "0.00")
         
-        # Now set to a date after the first deposit (2024-11-19)
-        reset_run_context("cli_1001", as_at="2024-11-20")
+        # Now set to a date after the first deposit (2025-04-02)
+        reset_run_context("cli_1001", as_at="2025-04-03")
         res = get_client_cash_balance("cli_1001")
-        self.assertEqual(res["cash_balance"], "11701.46")
+        self.assertEqual(res["cash_balance"], "10581.85")
 
     def test_uncovered_symbol_abstention(self):
         # Mock a holdings check where the symbol is uncovered (e.g. BTC)
