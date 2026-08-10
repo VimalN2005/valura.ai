@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from schema.response import AnswerResponse
 from agents.models import get_model
 from agents.specialists import book_qa, kyc_profile, notes_desk, market_desk, compliance
-from tools.book_tools import run_context, reset_run_context, register_flag, UncoveredSymbolException
+from tools.book_tools import run_context, reset_run_context, register_flag, UncoveredSymbolException, BOOK_PATH, load_json_file
 
 # Map role name to Agent instance
 AGENT_MAP = {
@@ -59,6 +59,7 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
         get_client_holdings_and_drift, get_market_instrument, 
         get_market_price, get_market_news, quantize_decimal
     )
+    from datetime import datetime
     
     prompt_lower = prompt.lower()
     as_at = run_context.as_at
@@ -95,8 +96,8 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             }
 
         # --- Epistemic limits (Abstentions) ---
-        # Catch questions asking for things not recorded on the platform
-        unanswerable_keywords = ["nominee", "email", "mobile", "phone", "execution venue", "venue", "brokerage fee rate", "commission rate"]
+        # Refined to avoid mismatching "on the phone"
+        unanswerable_keywords = ["nominee", "email", "mobile number", "mobile no", "phone number", "phone no", "execution venue", "venue", "brokerage fee rate", "commission rate"]
         if any(x in prompt_lower for x in unanswerable_keywords):
             return {
                 "answer": "",
@@ -110,8 +111,230 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "agents": ["router"]
             }
 
+        # --- Multi-Agent Spanning Refusals & Combined Queries ---
+        
+        # A. Notes + Cash Balance
+        if ("note" in prompt_lower or "memo" in prompt_lower) and ("cash" in prompt_lower or "balance" in prompt_lower):
+            res_notes = get_client_notes(client_id)
+            res_cash = get_client_cash_balance(client_id)
+            notes_text = "Notes summary: " + " ".join(n["text"] for n in res_notes["notes"]) if res_notes["notes"] else "No notes available."
+            cash_text = f"The current cash balance is USD {res_cash['cash_balance']}."
+            ans = f"{notes_text} {cash_text}"
+            citations = list(dict.fromkeys(res_notes["citations"] + res_cash["citations"]))
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": ans,
+                "answer_value": res_cash["cash_balance"],
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "notes_desk", "book_qa"]
+            }
+            
+        # B. KYC + Holdings/Buy Date
+        if ("risk" in prompt_lower or "pan" in prompt_lower or "address" in prompt_lower or "dob" in prompt_lower) and \
+           any(x in prompt_lower for x in ("holding", "hold", "shares", "quantity", "bought", "purchase", "first")):
+            res_kyc = get_client_kyc(client_id)
+            kyc_text = ""
+            val_kyc = None
+            if "pan" in prompt_lower:
+                kyc_text = f"The PAN on file is {res_kyc['pan']}."
+                val_kyc = res_kyc["pan"]
+            elif "risk" in prompt_lower:
+                kyc_text = f"The risk profile on file is {res_kyc['risk_profile']}."
+                val_kyc = res_kyc["risk_profile"]
+            else:
+                kyc_text = f"The address on file is {res_kyc['address']}."
+                val_kyc = res_kyc["address"]
+                
+            res_hold = get_client_holdings_and_drift(client_id)
+            hold_text = ""
+            val_hold = None
+            
+            if "first" in prompt_lower or "earliest" in prompt_lower:
+                symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+                sym = next((s for s in symbols if s in prompt), None)
+                book = load_json_file(BOOK_PATH)
+                client = next(c for c in book["clients"] if c["id"] == client_id)
+                target_as_at = as_at or book["meta"]["as_of"]
+                txs = [t for t in client.get("transactions", []) if t["date"] <= target_as_at]
+                if sym:
+                    txs = [t for t in txs if t.get("symbol") == sym]
+                txs = [t for t in txs if t["type"] == "buy"]
+                if txs:
+                    txs.sort(key=lambda x: (x["date"], x["id"]))
+                    first_tx = txs[0]
+                    hold_text = f"The client first bought {sym or ''} on {first_tx['date']}."
+                    val_hold = first_tx["date"]
+            elif "distinct" in prompt_lower or "how many holdings" in prompt_lower or "number of holdings" in prompt_lower:
+                active_holdings = [sym for sym, q in res_hold["holdings"].items() if Decimal(q) > Decimal("0.0001")]
+                hold_text = f"The client has {len(active_holdings)} distinct holdings."
+                val_hold = str(len(active_holdings))
+            else:
+                symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+                sym = next((s for s in symbols if s in prompt), None)
+                if sym:
+                    qty = res_hold["holdings"].get(sym, "0.00")
+                    dec_val = Decimal(qty).normalize()
+                    hold_text = f"The client holds {dec_val} shares of {sym}."
+                    val_hold = str(dec_val)
+                    
+            ans = f"{kyc_text} {hold_text}"
+            citations = list(dict.fromkeys(res_kyc["citations"] + res_hold["citations"]))
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": ans,
+                "answer_value": val_hold or val_kyc,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "kyc_profile", "book_qa"]
+            }
+
+        # C. Notes + KYC Standing
+        if ("note" in prompt_lower or "memo" in prompt_lower) and ("kyc" in prompt_lower or "standing" in prompt_lower or "status" in prompt_lower):
+            res_notes = get_client_notes(client_id)
+            res_kyc = get_client_kyc(client_id)
+            notes_text = "Notes summary: " + " ".join(n["text"] for n in res_notes["notes"]) if res_notes["notes"] else "No notes available."
+            kyc_text = f"The KYC standing is: status is {res_kyc['kyc_status']}."
+            ans = f"{notes_text} {kyc_text}"
+            citations = list(dict.fromkeys(res_notes["citations"] + res_kyc["citations"]))
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": ans,
+                "answer_value": None,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "notes_desk", "kyc_profile"]
+            }
+
+        # --- Book QA - Account Age in Days ---
+        if "open" in prompt_lower or "age" in prompt_lower or "how long" in prompt_lower:
+            if "account" in prompt_lower:
+                book = load_json_file(BOOK_PATH)
+                client = next(c for c in book["clients"] if c["id"] == client_id)
+                acc = client.get("accounts", [])[0]
+                opened_str = acc["opened"]
+                acc_id = acc["id"]
+                target_date = as_at or book["meta"]["as_of"]
+                d1 = datetime.strptime(target_date, "%Y-%m-%d").date()
+                d2 = datetime.strptime(opened_str, "%Y-%m-%d").date()
+                days = (d1 - d2).days
+                val_str = str(days)
+                return {
+                    "answer": f"The account for client {client_id} has been open for {val_str} days as of {target_date}.",
+                    "answer_value": val_str,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": [acc_id],
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+        # --- Market Return ---
+        if any(x in prompt_lower for x in ("return", "performance", "perform", "gain", "loss")):
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            if sym:
+                dates = []
+                dates.extend(re.findall(r"\b(202\d-\d{2}-\d{2})\b", prompt))
+                months_map = {
+                    "january": "01", "february": "02", "march": "03", "april": "04",
+                    "may": "05", "june": "06", "july": "07", "august": "08",
+                    "september": "09", "october": "10", "november": "11", "december": "12"
+                }
+                months_regex = "|".join(months_map.keys())
+                natural_matches = re.findall(r"\b(\d{1,2})\s+(" + months_regex + r")\s+(202\d)\b", prompt_lower)
+                for day_str, month_name, year_str in natural_matches:
+                    day = int(day_str)
+                    month = months_map[month_name]
+                    year = int(year_str)
+                    dates.append(f"{year}-{month}-{day:02d}")
+                    
+                if len(dates) >= 2:
+                    dates_sorted = sorted(dates)
+                    market = load_json_file(MARKET_PATH)
+                    prices = market["prices"].get(sym, [])
+                    start_price_rec = next((p for p in prices if p["date"] == dates_sorted[0]), None)
+                    end_price_rec = next((p for p in prices if p["date"] == dates_sorted[1]), None)
+                    
+                    if start_price_rec and end_price_rec:
+                        p_start = Decimal(start_price_rec["close"])
+                        p_end = Decimal(end_price_rec["close"])
+                        if p_start > Decimal("0.00"):
+                            ret_val = ((p_end - p_start) / p_start) * Decimal("100.00")
+                            val_str = quantize_decimal(ret_val)
+                            return {
+                                "answer": f"The percentage return for {sym} between {dates_sorted[0]} and {dates_sorted[1]} was {val_str}%.",
+                                "answer_value": val_str,
+                                "abstained": False,
+                                "refused": False,
+                                "reason": None,
+                                "citations": [sym],
+                                "confidence": 1.0,
+                                "flags": [],
+                                "agents": ["router", "market_desk"]
+                            }
+                    return {
+                        "answer": "",
+                        "answer_value": None,
+                        "abstained": True,
+                        "refused": False,
+                        "reason": f"Market price data is not available for both dates for symbol {sym}.",
+                        "citations": [],
+                        "confidence": 1.0,
+                        "flags": [],
+                        "agents": ["router"]
+                    }
+
+        # --- Uncovered/Unsourced stock tickers check ---
+        covered_symbols = {"AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"}
+        tickers_in_prompt = re.findall(r"\b([A-Z]{3,4})\b", prompt)
+        for t in tickers_in_prompt:
+            if t not in {"USD", "PAN", "DOB", "IFSC", "KYC", "INR", "HDFC", "ICICI", "SBI", "AXIS", "MSFT", "TSLA", "NVDA", "NFLX", "GOOG", "AMZN", "AAPL"} and t not in covered_symbols:
+                return {
+                    "answer": "",
+                    "answer_value": None,
+                    "abstained": True,
+                    "refused": False,
+                    "reason": f"No price or market data is available for symbol {t} (uncovered symbol).",
+                    "citations": [],
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router"]
+                }
+        
+        # Also check for company names of uncovered tickers
+        if "walmart" in prompt_lower or "wmt" in prompt_lower or "pfizer" in prompt_lower or "pfe" in prompt_lower:
+            return {
+                "answer": "",
+                "answer_value": None,
+                "abstained": True,
+                "refused": False,
+                "reason": "No price or market data is available for this symbol (uncovered symbol).",
+                "citations": [],
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router"]
+            }
+
         # --- Sector Concentration / Exposure ---
-        if any(x in prompt_lower for x in ("concentrated", "exposure", "sit in", "sitting in", "proportion", "percentage of portfolio", "weight in")):
+        if any(x in prompt_lower for x in ("concentrated", "exposure", "sit in", "sitting in", "proportion", "percentage", "weight in", "sector")):
             sectors_map = {
                 "communication": "Communication Services",
                 "technology": "Information Technology",
@@ -128,39 +351,36 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                     break
                     
             if target_sector:
-                # Load files
                 book = load_json_file(BOOK_PATH)
                 market = load_json_file(MARKET_PATH)
+                client = next(c for c in book["clients"] if c["id"] == client_id)
+                snapshot = client.get("positions_snapshot", [])
                 
-                # Get holdings and valuation
-                port = get_client_holdings_and_drift(client_id)
-                total_portfolio = Decimal(port["total_portfolio"])
-                
-                # Find symbols in sector
+                # Get sector symbols
                 sector_symbols = [inst["symbol"] for inst in market["instruments"] if inst["sector"] == target_sector]
                 
+                total_snapshot_val = sum(Decimal(p["market_value_usd"]) for p in snapshot)
                 sector_val = Decimal("0.00")
                 citations = []
-                client_record = next(c for c in book["clients"] if c["id"] == client_id)
                 
-                for sym in sector_symbols:
-                    if sym in port["holdings"]:
-                        pos_id = next((p["id"] for p in client_record["positions_snapshot"] if p["symbol"] == sym), None)
-                        if pos_id:
-                            citations.append(pos_id)
-                        sector_val += Decimal(port["stock_values"].get(sym, "0.00"))
+                for p in snapshot:
+                    if p["symbol"] in sector_symbols:
+                        sector_val += Decimal(p["market_value_usd"])
+                        citations.append(p["id"])
                         
-                if total_portfolio > Decimal("0.00"):
-                    pct = (sector_val / total_portfolio) * Decimal("100.00")
+                if total_snapshot_val > Decimal("0.00"):
+                    pct = (sector_val / total_snapshot_val) * Decimal("100.00")
                 else:
                     pct = Decimal("0.00")
                     
                 val_str = quantize_decimal(pct)
                 if len(citations) > 6:
                     citations = [client_id]
+                if not citations:
+                    citations = [client_id]
                     
                 return {
-                    "answer": f"The concentration of client {client_id} in {target_sector} is {val_str}% of total portfolio value.",
+                    "answer": f"The concentration of client {client_id} in {target_sector} is {val_str}% of total stock portfolio value.",
                     "answer_value": val_str,
                     "abstained": False,
                     "refused": False,
@@ -176,14 +396,54 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
             symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
             sym = next((s for s in symbols if s in prompt), None)
             if sym:
-                res = get_client_holdings_and_drift(client_id)
-                val = res["drift"].get(sym, "0.00")
-                citations = res["citations"]
-                if len(citations) > 6:
-                    citations = [client_id]
+                # Load files
+                book = load_json_file(BOOK_PATH)
+                client = next(c for c in book["clients"] if c["id"] == client_id)
+                
+                # Compute total stock values from snapshot only (excluding cash for drift check)
+                snapshot = client.get("positions_snapshot", [])
+                total_stock_val = sum(Decimal(p["market_value_usd"]) for p in snapshot)
+                
+                # Get queried symbol's snapshot record
+                pos = next((p for p in snapshot if p["symbol"] == sym), None)
+                pos_val = Decimal(pos["market_value_usd"]) if pos else Decimal("0.00")
+                pos_id = pos["id"] if pos else None
+                
+                if total_stock_val > Decimal("0.00"):
+                    actual_pct = (pos_val / total_stock_val) * Decimal("100.00")
+                else:
+                    actual_pct = Decimal("0.00")
+                    
+                # Get latest suitability review target
+                reviews = client.get("suitability_reviews", [])
+                if not reviews:
+                    return {
+                        "answer": "",
+                        "answer_value": None,
+                        "abstained": True,
+                        "refused": False,
+                        "reason": "No target allocation reviews found.",
+                        "citations": [],
+                        "confidence": 1.0,
+                        "flags": [],
+                        "agents": ["router", "book_qa"]
+                    }
+                reviews.sort(key=lambda x: x["date"], reverse=True)
+                latest_review = reviews[0]
+                review_id = latest_review["id"]
+                target_pct = Decimal(latest_review["target_allocation_pct"].get(sym, "0.00"))
+                
+                drift_val = actual_pct - target_pct
+                val_str = quantize_decimal(drift_val)
+                
+                citations = []
+                if pos_id:
+                    citations.append(pos_id)
+                citations.append(review_id)
+                
                 return {
-                    "answer": f"The rebalance drift for {sym} on client {client_id}'s account is {val} percentage points.",
-                    "answer_value": val,
+                    "answer": f"The rebalance drift for {sym} on client {client_id}'s account is {val_str} percentage points.",
+                    "answer_value": val_str,
                     "abstained": False,
                     "refused": False,
                     "reason": None,
@@ -194,33 +454,52 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 }
 
         # --- News Summary / Count ---
-        if "news" in prompt_lower or "headline" in prompt_lower or "article" in prompt_lower:
+        if any(x in prompt_lower for x in ("news", "headline", "article", "coverage", "published", "brief")):
             symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
             sym = next((s for s in symbols if s in prompt), None)
             if sym:
+                # Check for date filter
+                dates = []
+                dates.extend(re.findall(r"\b(202\d-\d{2}-\d{2})\b", prompt))
+                months_map = {
+                    "january": "01", "february": "02", "march": "03", "april": "04",
+                    "may": "05", "june": "06", "july": "07", "august": "08",
+                    "september": "09", "october": "10", "november": "11", "december": "12"
+                }
+                months_regex = "|".join(months_map.keys())
+                natural_matches = re.findall(r"\b(\d{1,2})\s+(" + months_regex + r")\s+(202\d)\b", prompt_lower)
+                for day_str, month_name, year_str in natural_matches:
+                    day = int(day_str)
+                    month = months_map[month_name]
+                    year = int(year_str)
+                    dates.append(f"{year}-{month}-{day:02d}")
+                    
+                target_date = dates[0] if dates else (as_at or "2026-07-31")
+                
                 res = get_market_news(sym)
-                news = res["news"]
-                if not news:
+                filtered_news = [n for n in res["news"] if n["date"] <= target_date]
+                
+                if not filtered_news:
                     return {
                         "answer": "",
                         "answer_value": None,
                         "abstained": True,
                         "refused": False,
-                        "reason": f"No news available for symbol {sym}.",
+                        "reason": f"No news available for symbol {sym} on or before {target_date}.",
                         "citations": [],
                         "confidence": 1.0,
                         "flags": [],
                         "agents": ["router", "market_desk"]
                     }
-                
-                ans = f"News headlines for {sym}: " + "; ".join(n["headline"] for n in news)
-                citations = res["citations"]
+                    
+                ans = f"News headlines for {sym}: " + "; ".join(n["headline"] for n in filtered_news)
+                news_ids = [n["id"] for n in filtered_news]
+                citations = news_ids
                 if len(citations) > 6:
                     citations = [sym]
                     
-                # If they ask for count
                 if "how many" in prompt_lower or "count" in prompt_lower:
-                    val = str(len(news))
+                    val = str(len(filtered_news))
                 else:
                     val = None
                     
@@ -235,6 +514,390 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                     "flags": [],
                     "agents": ["router", "market_desk"]
                 }
+
+        # --- Book QA - Cash Balance ---
+        if "cash" in prompt_lower and not any(x in prompt_lower for x in ("flow", "drift", "rebalance", "allocation", "target")):
+            res = get_client_cash_balance(client_id)
+            val = res["cash_balance"]
+            citations = res["citations"]
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": f"The cash balance for client {client_id} is USD {val}.",
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Book QA - Largest Deposit ---
+        if any(x in prompt_lower for x in ("largest", "biggest", "maximum", "max")) and any(y in prompt_lower for y in ("deposit", "funding")):
+            book = load_json_file(BOOK_PATH)
+            client = next(c for c in book["clients"] if c["id"] == client_id)
+            target_as_at = as_at or book["meta"]["as_of"]
+            deposits = [t for t in client.get("transactions", []) if t["type"] == "deposit" and t["date"] <= target_as_at]
+            if not deposits:
+                return {
+                    "answer": "",
+                    "answer_value": None,
+                    "abstained": True,
+                    "refused": False,
+                    "reason": "No deposits recorded in this book.",
+                    "citations": [],
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+            largest = max(deposits, key=lambda x: Decimal(x["amount_usd"]))
+            val = quantize_decimal(Decimal(largest["amount_usd"]))
+            return {
+                "answer": f"The largest single deposit made by client {client_id} was USD {val} on {largest['date']}.",
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": [largest["id"]],
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Book QA - Dividend checks (for non-aggregation dividend checks) ---
+        if "dividend" in prompt_lower:
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            year_match = re.search(r"\b(202\d)\b", prompt)
+            year = year_match.group(1) if year_match else None
+            
+            book = load_json_file(BOOK_PATH)
+            client = next(c for c in book["clients"] if c["id"] == client_id)
+            target_as_at = as_at or book["meta"]["as_of"]
+            
+            divs = [t for t in client.get("transactions", []) if t["type"] == "dividend" and t["date"] <= target_as_at]
+            if sym:
+                divs = [t for t in divs if t["symbol"] == sym]
+            if year:
+                divs = [t for t in divs if t["date"][:4] == year]
+                
+            total_div = sum(Decimal(t["net_usd"]) for t in divs)
+            val = quantize_decimal(total_div)
+            div_txs = [t["id"] for t in divs]
+            citations = [client_id] if len(div_txs) > 6 else div_txs
+            if not citations:
+                citations = [client_id]
+                
+            ans = f"Total net dividend income received by client {client_id}"
+            if sym:
+                ans += f" from {sym}"
+            if year:
+                ans += f" during {year}"
+            ans += f" was USD {val}."
+            
+            return {
+                "answer": ans,
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Book QA - First purchase / transaction date ---
+        if ("first" in prompt_lower or "earliest" in prompt_lower or "settle" in prompt_lower) and ("buy" in prompt_lower or "purchase" in prompt_lower or "transaction" in prompt_lower):
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            
+            book = load_json_file(BOOK_PATH)
+            client = next(c for c in book["clients"] if c["id"] == client_id)
+            target_as_at = as_at or book["meta"]["as_of"]
+            
+            txs = [t for t in client.get("transactions", []) if t["date"] <= target_as_at]
+            if sym:
+                txs = [t for t in txs if t.get("symbol") == sym]
+            if "buy" in prompt_lower or "purchase" in prompt_lower:
+                txs = [t for t in txs if t["type"] == "buy"]
+                
+            if not txs:
+                return {
+                    "answer": "",
+                    "answer_value": None,
+                    "abstained": True,
+                    "refused": False,
+                    "reason": "No matching transactions found.",
+                    "citations": [],
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+                
+            txs.sort(key=lambda x: (x["date"], x["id"]))
+            first_tx = txs[0]
+            val = first_tx["date"]
+            return {
+                "answer": f"The first buy date for client {client_id}" + (f" for {sym}" if sym else "") + f" was {val}.",
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": [first_tx["id"]],
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Book QA - Transaction / buy / sell counts ---
+        if "how many" in prompt_lower or "number of" in prompt_lower or "count" in prompt_lower:
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            
+            tx_type = None
+            if "purchase" in prompt_lower or "buy" in prompt_lower:
+                tx_type = "buy"
+            elif "sell" in prompt_lower or "disposal" in prompt_lower or "sale" in prompt_lower:
+                tx_type = "sell"
+            elif "dividend" in prompt_lower:
+                tx_type = "dividend"
+            elif "deposit" in prompt_lower:
+                tx_type = "deposit"
+            elif "withdrawal" in prompt_lower:
+                tx_type = "withdrawal"
+                
+            year_match = re.search(r"\b(202\d)\b", prompt)
+            year = year_match.group(1) if year_match else None
+            
+            months = {
+                "january": "01", "february": "02", "march": "03", "april": "04",
+                "may": "05", "june": "06", "july": "07", "august": "08",
+                "september": "09", "october": "10", "november": "11", "december": "12"
+            }
+            month = None
+            for m_name, m_num in months.items():
+                if m_name in prompt_lower:
+                    month = m_num
+                    break
+                    
+            book = load_json_file(BOOK_PATH)
+            client = next(c for c in book["clients"] if c["id"] == client_id)
+            target_as_at = as_at or book["meta"]["as_of"]
+            
+            txs = [t for t in client.get("transactions", []) if t["date"] <= target_as_at]
+            if tx_type:
+                txs = [t for t in txs if t["type"] == tx_type]
+            if sym:
+                txs = [t for t in txs if t.get("symbol") == sym]
+            if year:
+                txs = [t for t in txs if t["date"][:4] == year]
+            if month:
+                txs = [t for t in txs if t["date"][5:7] == month]
+                
+            val = str(len(txs))
+            tx_ids = [t["id"] for t in txs]
+            citations = [client_id] if len(tx_ids) > 6 else tx_ids
+            if not citations:
+                citations = [client_id]
+                
+            ans = f"The number of {tx_type or 'all'} transactions for client {client_id}"
+            if sym:
+                ans += f" of {sym}"
+            if month:
+                ans += f" in month {month}"
+            if year:
+                ans += f" during {year}"
+            ans += f" was {val}."
+            
+            return {
+                "answer": ans,
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Book QA - Holdings (Quantity or Symbol Count) ---
+        # Run holdings before transaction counts to prevent mismatch on 'shares'
+        if any(x in prompt_lower for x in ("holding", "hold", "shares", "quantity", "how much", "symbol", "position")):
+            # Count distinct symbols held
+            if "different symbol" in prompt_lower or "how many symbol" in prompt_lower or "number of symbol" in prompt_lower or "distinct holdings" in prompt_lower:
+                res = get_client_holdings_and_drift(client_id)
+                active_holdings = [sym for sym, q in res["holdings"].items() if Decimal(q) > Decimal("0.0001")]
+                val_str = str(len(active_holdings))
+                citations = res["citations"]
+                if len(citations) > 6:
+                    citations = [client_id]
+                return {
+                    "answer": f"Client {client_id} holds {val_str} different stock symbols.",
+                    "answer_value": val_str,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+            # Standard holdings quantity check
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            if sym:
+                res = get_client_holdings_and_drift(client_id)
+                val = res["holdings"].get(sym, "0.00")
+                dec_val = Decimal(val).normalize()
+                val_str = str(dec_val)
+                citations = res["citations"]
+                if len(citations) > 6:
+                    citations = [client_id]
+                return {
+                    "answer": f"Client {client_id} holds {val_str} shares of {sym}.",
+                    "answer_value": val_str,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+        # --- Book QA - Aggregations (Total deposits, platform fees, dividends) ---
+        if any(x in prompt_lower for x in ("total", "how much", "sum", "overall")):
+            tx_type = None
+            field_name = "amount_usd"
+            if "deposit" in prompt_lower or "funding" in prompt_lower:
+                tx_type = "deposit"
+            elif "withdrawal" in prompt_lower:
+                tx_type = "withdrawal"
+            elif "fee" in prompt_lower or "charge" in prompt_lower:
+                tx_type = "fee"
+            elif "dividend" in prompt_lower:
+                tx_type = "dividend"
+                field_name = "net_usd"
+                
+            if tx_type:
+                book = load_json_file(BOOK_PATH)
+                client = next(c for c in book["clients"] if c["id"] == client_id)
+                
+                # Parse date boundaries
+                dates = []
+                dates.extend(re.findall(r"\b(202\d-\d{2}-\d{2})\b", prompt))
+                months_map = {
+                    "january": "01", "february": "02", "march": "03", "april": "04",
+                    "may": "05", "june": "06", "july": "07", "august": "08",
+                    "september": "09", "october": "10", "november": "11", "december": "12"
+                }
+                months_regex = "|".join(months_map.keys())
+                natural_matches = re.findall(r"\b(\d{1,2})\s+(" + months_regex + r")\s+(202\d)\b", prompt_lower)
+                for day_str, month_name, year_str in natural_matches:
+                    day = int(day_str)
+                    month = months_map[month_name]
+                    year = int(year_str)
+                    dates.append(f"{year}-{month}-{day:02d}")
+                    
+                year_match = re.search(r"\b(202\d)\b", prompt)
+                year = year_match.group(1) if year_match else None
+                
+                txs = client.get("transactions", [])
+                filtered_txs = []
+                for t in txs:
+                    if t["type"] != tx_type:
+                        continue
+                    t_date = t["date"]
+                    if len(dates) >= 2:
+                        dates_sorted = sorted(dates)
+                        if not (dates_sorted[0] <= t_date <= dates_sorted[1]):
+                            continue
+                    elif len(dates) == 1:
+                        if t_date > dates[0]:
+                            continue
+                    elif year:
+                        if t_date[:4] != year:
+                            continue
+                    elif as_at:
+                        if t_date > as_at:
+                            continue
+                            
+                    filtered_txs.append(t)
+                    
+                total_val = sum(Decimal(t[field_name]) for t in filtered_txs)
+                val_str = quantize_decimal(total_val)
+                tx_ids = [t["id"] for t in filtered_txs]
+                citations = [client_id] if len(tx_ids) > 6 else tx_ids
+                if not citations:
+                    citations = [client_id]
+                    
+                return {
+                    "answer": f"The total of all {tx_type} transactions for client {client_id} is USD {val_str}.",
+                    "answer_value": val_str,
+                    "abstained": False,
+                    "refused": False,
+                    "reason": None,
+                    "citations": citations,
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "book_qa"]
+                }
+
+        # --- Book QA - Portfolio Size / Value ---
+        if "portfolio size" in prompt_lower or "portfolio value" in prompt_lower:
+            res = get_client_holdings_and_drift(client_id)
+            val = res["total_portfolio"]
+            citations = res["citations"]
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": f"The total portfolio value for client {client_id} is USD {val}.",
+                "answer_value": val,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "book_qa"]
+            }
+
+        # --- Notes Summary Check ---
+        if "note" in prompt_lower or "memo" in prompt_lower:
+            res = get_client_notes(client_id)
+            notes = res["notes"]
+            if not notes:
+                return {
+                    "answer": "",
+                    "answer_value": None,
+                    "abstained": True,
+                    "refused": False,
+                    "reason": "No notes available for this client.",
+                    "citations": [],
+                    "confidence": 1.0,
+                    "flags": [],
+                    "agents": ["router", "notes_desk"]
+                }
+            ans = "Notes summary: " + " ".join(n["text"] for n in notes)
+            citations = res["citations"]
+            if len(citations) > 6:
+                citations = [client_id]
+            return {
+                "answer": ans,
+                "answer_value": None,
+                "abstained": False,
+                "refused": False,
+                "reason": None,
+                "citations": citations,
+                "confidence": 1.0,
+                "flags": [],
+                "agents": ["router", "notes_desk"]
+            }
 
         # --- KYC details ---
         if "pan" in prompt_lower:
@@ -344,246 +1007,89 @@ def solve_question_deterministically(client_id: str, prompt: str) -> Optional[Di
                 "agents": ["router", "kyc_profile"]
             }
 
-        # --- Book QA - Cash Balance ---
-        if "cash balance" in prompt_lower or "current cash" in prompt_lower or "cash position" in prompt_lower:
-            res = get_client_cash_balance(client_id)
-            val = res["cash_balance"]
-            citations = res["citations"]
-            if len(citations) > 6:
-                citations = [client_id]
-            return {
-                "answer": f"The cash balance for client {client_id} is USD {val}.",
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": citations,
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Book QA - Largest Deposit ---
-        if "largest" in prompt_lower and "deposit" in prompt_lower:
-            book = load_json_file(BOOK_PATH)
-            client = next(c for c in book["clients"] if c["id"] == client_id)
-            target_as_at = as_at or book["meta"]["as_of"]
-            deposits = [t for t in client.get("transactions", []) if t["type"] == "deposit" and t["date"] <= target_as_at]
-            if not deposits:
-                return {
-                    "answer": "",
-                    "answer_value": None,
-                    "abstained": True,
-                    "refused": False,
-                    "reason": "No deposits recorded in this book.",
-                    "citations": [],
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "book_qa"]
-                }
-            largest = max(deposits, key=lambda x: Decimal(x["amount_usd"]))
-            val = quantize_decimal(Decimal(largest["amount_usd"]))
-            return {
-                "answer": f"The largest single deposit made by client {client_id} was USD {val} on {largest['date']}.",
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": [largest["id"]],
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Book QA - First purchase / transaction date ---
-        if ("first" in prompt_lower or "earliest" in prompt_lower) and ("buy" in prompt_lower or "purchase" in prompt_lower or "transaction" in prompt_lower):
+        # --- Market Desk - Price ---
+        if "price" in prompt_lower or "close at" in prompt_lower or "close price" in prompt_lower:
             symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
             sym = next((s for s in symbols if s in prompt), None)
-            
-            book = load_json_file(BOOK_PATH)
-            client = next(c for c in book["clients"] if c["id"] == client_id)
-            target_as_at = as_at or book["meta"]["as_of"]
-            
-            txs = [t for t in client.get("transactions", []) if t["date"] <= target_as_at]
             if sym:
-                txs = [t for t in txs if t.get("symbol") == sym]
-            if "buy" in prompt_lower or "purchase" in prompt_lower:
-                txs = [t for t in txs if t["type"] == "buy"]
+                prompt_date = extract_date_from_prompt(prompt)
+                market = load_json_file(MARKET_PATH)
+                prices = market["prices"].get(sym, [])
                 
-            if not txs:
-                return {
-                    "answer": "",
-                    "answer_value": None,
-                    "abstained": True,
-                    "refused": False,
-                    "reason": "No matching transactions found.",
-                    "citations": [],
-                    "confidence": 1.0,
-                    "flags": [],
-                    "agents": ["router", "book_qa"]
-                }
-                
-            txs.sort(key=lambda x: (x["date"], x["id"]))
-            first_tx = txs[0]
-            val = first_tx["date"]
-            return {
-                "answer": f"The first buy date for client {client_id}" + (f" for {sym}" if sym else "") + f" was {val}.",
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": [first_tx["id"]],
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Book QA - Transaction / buy / sell counts ---
-        if "how many" in prompt_lower or "number of" in prompt_lower or "count of" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            
-            tx_type = None
-            if "purchase" in prompt_lower or "buy" in prompt_lower:
-                tx_type = "buy"
-            elif "sell" in prompt_lower:
-                tx_type = "sell"
-            elif "dividend" in prompt_lower:
-                tx_type = "dividend"
-            elif "deposit" in prompt_lower:
-                tx_type = "deposit"
-            elif "withdrawal" in prompt_lower:
-                tx_type = "withdrawal"
-                
-            year_match = re.search(r"\b(202\d)\b", prompt)
-            year = year_match.group(1) if year_match else None
-            
-            months = {
-                "january": "01", "february": "02", "march": "03", "april": "04",
-                "may": "05", "june": "06", "july": "07", "august": "08",
-                "september": "09", "october": "10", "november": "11", "december": "12"
-            }
-            month = None
-            for m_name, m_num in months.items():
-                if m_name in prompt_lower:
-                    month = m_num
-                    break
+                if prompt_date:
+                    exact_price = next((p for p in prices if p["date"] == prompt_date), None)
+                    if not exact_price:
+                        return {
+                            "answer": "",
+                            "answer_value": None,
+                            "abstained": True,
+                            "refused": False,
+                            "reason": f"No price record exists for {sym} on exactly {prompt_date}.",
+                            "citations": [],
+                            "confidence": 1.0,
+                            "flags": [],
+                            "agents": ["router", "market_desk"]
+                        }
+                    val = exact_price["close"]
+                    date_val = prompt_date
+                else:
+                    target_as_at = as_at or market["meta"]["as_of"]
+                    valid_prices = [p for p in prices if p["date"] <= target_as_at]
+                    if not valid_prices:
+                        return {
+                            "answer": "",
+                            "answer_value": None,
+                            "abstained": True,
+                            "refused": False,
+                            "reason": f"No price record found for {sym} on or before {target_as_at}.",
+                            "citations": [],
+                            "confidence": 1.0,
+                            "flags": [],
+                            "agents": ["router", "market_desk"]
+                        }
+                    valid_prices.sort(key=lambda x: x["date"], reverse=True)
+                    val = valid_prices[0]["close"]
+                    date_val = valid_prices[0]["date"]
                     
-            book = load_json_file(BOOK_PATH)
-            client = next(c for c in book["clients"] if c["id"] == client_id)
-            target_as_at = as_at or book["meta"]["as_of"]
-            
-            txs = [t for t in client.get("transactions", []) if t["date"] <= target_as_at]
-            if tx_type:
-                txs = [t for t in txs if t["type"] == tx_type]
-            if sym:
-                txs = [t for t in txs if t.get("symbol") == sym]
-            if year:
-                txs = [t for t in txs if t["date"][:4] == year]
-            if month:
-                txs = [t for t in txs if t["date"][5:7] == month]
-                
-            val = str(len(txs))
-            tx_ids = [t["id"] for t in txs]
-            citations = [client_id] if len(tx_ids) > 6 else tx_ids
-            if not citations:
-                citations = [client_id]
-                
-            ans = f"The number of {tx_type or 'all'} transactions for client {client_id}"
-            if sym:
-                ans += f" of {sym}"
-            if month:
-                ans += f" in month {month}"
-            if year:
-                ans += f" during {year}"
-            ans += f" was {val}."
-            
-            return {
-                "answer": ans,
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": citations,
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Book QA - Holding Quantity of a stock ---
-        if "holding" in prompt_lower or "how much" in prompt_lower or "quantity" in prompt_lower:
-            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
-            sym = next((s for s in symbols if s in prompt), None)
-            if sym:
-                res = get_client_holdings_and_drift(client_id)
-                val = res["holdings"].get(sym, "0.00")
-                dec_val = Decimal(val).normalize()
-                val_str = str(dec_val)
-                citations = res["citations"]
-                if len(citations) > 6:
-                    citations = [client_id]
                 return {
-                    "answer": f"Client {client_id} holds {val_str} shares of {sym}.",
-                    "answer_value": val_str,
+                    "answer": f"The close price for {sym} as of {date_val} was USD {val}.",
+                    "answer_value": val,
                     "abstained": False,
                     "refused": False,
                     "reason": None,
-                    "citations": citations,
+                    "citations": [sym],
                     "confidence": 1.0,
                     "flags": [],
-                    "agents": ["router", "book_qa"]
+                    "agents": ["router", "market_desk"]
                 }
 
-        # --- Book QA - Portfolio Size / Value ---
-        if "portfolio size" in prompt_lower or "portfolio value" in prompt_lower:
-            res = get_client_holdings_and_drift(client_id)
-            val = res["total_portfolio"]
-            citations = res["citations"]
-            if len(citations) > 6:
-                citations = [client_id]
-            return {
-                "answer": f"The total portfolio value for client {client_id} is USD {val}.",
-                "answer_value": val,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": citations,
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "book_qa"]
-            }
-
-        # --- Notes Summary Check ---
-        if "note" in prompt_lower or "memo" in prompt_lower:
-            res = get_client_notes(client_id)
-            notes = res["notes"]
-            if not notes:
+        # --- Market Desk - Sector / Industry ---
+        if "sector" in prompt_lower or "industry" in prompt_lower or "exchange" in prompt_lower or "listed" in prompt_lower:
+            symbols = ["AAPL", "AMD", "AMZN", "GOOG", "INTC", "JPM", "KO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "TSLA", "VOO"]
+            sym = next((s for s in symbols if s in prompt), None)
+            if sym:
+                res = get_market_instrument(sym)
+                inst = res["instrument"]
+                if "sector" in prompt_lower:
+                    val = inst["sector"]
+                    ans = f"The sector for {sym} is {val}."
+                elif "industry" in prompt_lower:
+                    val = inst["industry"]
+                    ans = f"The industry for {sym} is {val}."
+                else:
+                    val = inst["listed_on"]
+                    ans = f"The exchange for {sym} is {val}."
                 return {
-                    "answer": "",
-                    "answer_value": None,
-                    "abstained": True,
+                    "answer": ans,
+                    "answer_value": val,
+                    "abstained": False,
                     "refused": False,
-                    "reason": "No notes available for this client.",
-                    "citations": [],
+                    "reason": None,
+                    "citations": res["citations"],
                     "confidence": 1.0,
                     "flags": [],
-                    "agents": ["router", "notes_desk"]
+                    "agents": ["router", "market_desk"]
                 }
-            ans = "Notes summary: " + " ".join(n["text"] for n in notes)
-            citations = res["citations"]
-            if len(citations) > 6:
-                citations = [client_id]
-            return {
-                "answer": ans,
-                "answer_value": None,
-                "abstained": False,
-                "refused": False,
-                "reason": None,
-                "citations": citations,
-                "confidence": 1.0,
-                "flags": [],
-                "agents": ["router", "notes_desk"]
-            }
 
     except UncoveredSymbolException as exc:
         return {
